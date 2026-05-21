@@ -13,6 +13,7 @@ from app.presentation.telegram_bot.keyboards.reply import BTN_ADMIN_PANEL, BTN_P
 from app.presentation.telegram_bot.message_utils import delete_user_message, get_last_bot_message_id, send_or_edit_message
 
 _RUNTIME: dict[str, object] = {}
+PUBLIC_DISHES_PER_PAGE = 6
 
 
 UUID_DRAFT_KEYS = {"franchise_id", "branch_id", "category_id", "dish_id"}
@@ -30,6 +31,7 @@ STATE_PROMPTS = {
     "dish_price": "💵 Цена\n\nВведите цену целым числом без валюты. Например: 2500. Если цену пока не нужно показывать, нажмите «Пропустить».",
     "dish_weight": "⚖️ Вес или объём\n\nНапример: 350 г, 0.3 л, 8 шт. Если указывать не нужно, нажмите «Пропустить».",
     "dish_photo": "📸 Фото блюда\n\nОтправьте фотографию блюда. Если фото пока нет, нажмите «Пропустить».",
+    "dish_preview": "✅ Проверьте карточку блюда перед сохранением.",
     "edit_dish_title": "✏️ Новое название блюда\n\nВведите новое название блюда.",
     "edit_dish_description": "✏️ Новое описание\n\nОтправьте новое описание. Чтобы оставить текущее значение, нажмите «Пропустить».",
     "edit_dish_price": "✏️ Новая цена\n\nВведите цену целым числом без валюты. Чтобы оставить текущую цену, нажмите «Пропустить».",
@@ -138,18 +140,25 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
     def actor(user) -> ActorCommand:
         return ActorCommand(telegram_id=user.id, username=user.username, first_name=user.first_name)
 
-    def keyboard(buttons: list[tuple[str, str]], back: bool = True) -> types.InlineKeyboardMarkup:
+    def keyboard(buttons: list[tuple[str, str]], back: bool = True, admin_home: bool = False) -> types.InlineKeyboardMarkup:
         markup = types.InlineKeyboardMarkup()
         for text, data in buttons:
             markup.row(types.InlineKeyboardButton(text=text, callback_data=data))
+        navigation_row = []
         if back:
-            markup.row(types.InlineKeyboardButton(text="Назад", callback_data="nav:back"))
+            navigation_row.append(types.InlineKeyboardButton(text="Назад", callback_data="nav:back"))
+        if admin_home:
+            navigation_row.append(types.InlineKeyboardButton(text="В главное меню", callback_data="adm:home"))
+        if navigation_row:
+            markup.row(*navigation_row)
         return markup
 
     def wizard_keyboard(chat_id: int, user_id: int) -> types.InlineKeyboardMarkup:
         session = get_session(chat_id, user_id)
         markup = types.InlineKeyboardMarkup()
         state = session.get("state")
+        if state == "dish_preview":
+            markup.row(types.InlineKeyboardButton(text="Сохранить блюдо", callback_data="wizard:save_dish"))
         if state in SKIPPABLE_STATES:
             markup.row(types.InlineKeyboardButton(text="Пропустить", callback_data="wizard:skip"))
         row = []
@@ -157,6 +166,7 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
             row.append(types.InlineKeyboardButton(text="Назад", callback_data="wizard:back"))
         row.append(types.InlineKeyboardButton(text="Отмена", callback_data="wizard:cancel"))
         markup.row(*row)
+        markup.row(types.InlineKeyboardButton(text="В главное меню", callback_data="adm:home"))
         return markup
 
     def resume_keyboard() -> types.InlineKeyboardMarkup:
@@ -170,13 +180,65 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
         send_or_edit_message(bot, chat_id, user_id, text, reply_markup=markup, photo=photo)
         session["message_id"] = get_last_bot_message_id(chat_id, user_id)
 
+    def format_saved_value(value) -> str:
+        if value is None or value == "":
+            return "пока не указано"
+        return str(value)
+
+    def prompt_for_state(state: str | None, draft: dict) -> str:
+        if not state:
+            return "Продолжите заполнение."
+        base = STATE_PROMPTS.get(state, "Продолжите заполнение.")
+        saved_map = {
+            "create_fr_title": ("Название", draft.get("title")),
+            "create_fr_slug": ("Код", draft.get("slug")),
+            "create_fr_description": ("Описание", draft.get("description")),
+            "branch_title": ("Название филиала", draft.get("title")),
+            "branch_address": ("Адрес", draft.get("address")),
+            "branch_phone": ("Телефон", draft.get("phone")),
+            "dish_title": ("Название блюда", draft.get("title")),
+            "dish_description": ("Описание", draft.get("description")),
+            "dish_price": ("Цена", draft.get("price")),
+            "dish_weight": ("Вес или объём", draft.get("weight")),
+            "dish_photo": ("Фото", "добавлено" if draft.get("photo_object_key") else None),
+            "dish_preview": ("Карточка", "готова к проверке"),
+        }
+        if state in saved_map:
+            label, value = saved_map[state]
+            return f"{base}\n\nСохранённое значение: {label}: {format_saved_value(value)}"
+        if state.startswith("edit_dish_") and "current_value" in draft:
+            return f"{base}\n\nТекущее значение: {format_saved_value(draft.get('current_value'))}"
+        return base
+
+    def render_dish_preview_text(draft: dict) -> str:
+        lines = ["👀 Предпросмотр карточки блюда", "", f"🍴 {draft.get('title') or 'Без названия'}"]
+        if draft.get("price") is not None:
+            lines.append(f"Цена: {draft.get('price')} ₽")
+        if draft.get("weight"):
+            lines.append(f"Вес или объём: {draft.get('weight')}")
+        if draft.get("description"):
+            lines.extend(["", str(draft.get("description"))])
+        if not draft.get("photo_object_key"):
+            lines.extend(["", "Фото не добавлено."])
+        lines.extend(["", "Если всё верно, нажмите «Сохранить блюдо». Чтобы изменить данные, нажмите «Назад»."])
+        return "\n".join(lines).strip()
+
+    def show_current_wizard_step(chat_id: int, user_id: int) -> None:
+        session = get_session(chat_id, user_id)
+        state = session.get("state")
+        draft = session.get("draft", {})
+        if state == "dish_preview":
+            send_or_edit(chat_id, user_id, render_dish_preview_text(draft), wizard_keyboard(chat_id, user_id), photo_storage.get_photo_source(draft.get("photo_object_key")))
+            return
+        send_or_edit(chat_id, user_id, prompt_for_state(state, draft), wizard_keyboard(chat_id, user_id))
+
     def start_wizard(chat_id: int, user_id: int, state: str, draft: dict) -> None:
         session = get_session(chat_id, user_id)
         session["state"] = state
         session["draft"] = draft
         session["history"] = []
         save_wizard(chat_id, user_id)
-        send_or_edit(chat_id, user_id, STATE_PROMPTS[state], wizard_keyboard(chat_id, user_id))
+        send_or_edit(chat_id, user_id, prompt_for_state(state, draft), wizard_keyboard(chat_id, user_id))
 
     def go_to_step(chat_id: int, user_id: int, state: str, draft: dict) -> None:
         session = get_session(chat_id, user_id)
@@ -184,7 +246,7 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
         session["state"] = state
         session["draft"] = draft
         save_wizard(chat_id, user_id)
-        send_or_edit(chat_id, user_id, STATE_PROMPTS[state], wizard_keyboard(chat_id, user_id))
+        send_or_edit(chat_id, user_id, prompt_for_state(state, draft), wizard_keyboard(chat_id, user_id))
 
     def render(chat_id: int, user_id: int, screen: dict, push: bool = False) -> None:
         clear_wizard(chat_id, user_id)
@@ -306,8 +368,19 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
             branch = service.get_branch(screen["branch_id"])
             category = service.repository.get_category(screen["category_id"])
             dishes = service.repository.list_dishes(screen["branch_id"], screen["category_id"], active_only=True)
-            text = render_public_category(branch, category, dishes)
-            buttons = [(dish_button_title(dish), f"pub:dish:{dish.id}") for dish in dishes]
+            page = int(screen.get("page", 0))
+            total_pages = max(1, (len(dishes) + PUBLIC_DISHES_PER_PAGE - 1) // PUBLIC_DISHES_PER_PAGE)
+            page = max(0, min(page, total_pages - 1))
+            start = page * PUBLIC_DISHES_PER_PAGE
+            page_dishes = dishes[start:start + PUBLIC_DISHES_PER_PAGE]
+            text = render_public_category(branch, category, dishes, page, total_pages)
+            buttons = [(dish_button_title(dish), f"pub:dish:{dish.id}") for dish in page_dishes]
+            page_row = []
+            if page > 0:
+                page_row.append(("◀️ Назад", f"pub:catp:{category.id}:{page - 1}"))
+            if page < total_pages - 1:
+                page_row.append(("Вперёд ▶️", f"pub:catp:{category.id}:{page + 1}"))
+            buttons.extend(page_row)
 
         elif view == "public_dish":
             dish = service.get_dish(screen["dish_id"])
@@ -334,7 +407,7 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
                     ("Скрыть блюдо" if dish.is_active else "Показать блюдо", f"adm:toggledish:{dish.id}"),
                 ]
 
-        send_or_edit(chat_id, user_id, text, keyboard(buttons, back=back) if buttons or back else None, photo=photo)
+        send_or_edit(chat_id, user_id, text, keyboard(buttons, back=back, admin_home=str(view).startswith(("admin", "franchise", "branch", "categor", "copy_", "dish"))) if buttons or back or str(view).startswith(("admin", "franchise", "branch", "categor", "copy_", "dish")) else None, photo=photo)
 
     def render_public_franchise(franchise: Franchise, branches: list[Branch]) -> str:
         lines = [f"🏷 {franchise.title}"]
@@ -362,14 +435,14 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
             lines.append(f"Блюд: {len(dishes)}")
         return "\n".join(lines).strip()
 
-    def render_public_category(branch: Branch | None, category: Category | None, dishes: list[Dish]) -> str:
+    def render_public_category(branch: Branch | None, category: Category | None, dishes: list[Dish], page: int = 0, total_pages: int = 1) -> str:
         lines = [f"📍 {branch.title}" if branch else "Меню", f"🍽 {category.title if category else 'Категория'}"]
         if not dishes:
             lines.extend(["", "В этом разделе пока нет блюд."])
         else:
-            lines.extend(["", "Выберите блюдо, чтобы посмотреть состав, цену и фото."])
-            for dish in dishes:
-                lines.append(f"• {dish_button_title(dish)}")
+            lines.extend(["", "Выберите блюдо кнопкой ниже, чтобы посмотреть состав, цену и фото."])
+            if total_pages > 1:
+                lines.append(f"Страница {page + 1} из {total_pages}")
         return "\n".join(lines).strip()
 
     def dish_button_title(dish: Dish) -> str:
@@ -418,7 +491,8 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
             return
         render(chat_id, user_id, {"view": "public_franchise", "franchise": franchise})
 
-    def finish_dish_creation(chat_id: int, user, draft: dict, photo_object_key: str | None) -> None:
+    def finish_dish_creation(chat_id: int, user, draft: dict, photo_object_key: str | None = None) -> None:
+        photo_key = photo_object_key if photo_object_key is not None else draft.get("photo_object_key")
         error, dish = service.create_dish(CreateDishCommand(
             telegram_id=user.id,
             username=user.username,
@@ -429,7 +503,7 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
             description=draft.get("description"),
             price=draft.get("price"),
             weight=draft.get("weight"),
-            photo_file_id=photo_object_key,
+            photo_file_id=photo_key,
         ))
         clear_wizard(chat_id, user.id)
         if error or not dish:
@@ -527,7 +601,7 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
         if data == "wizard:resume":
             state = session.get("state")
             if state:
-                send_or_edit(chat_id, user_id, STATE_PROMPTS.get(state, "Продолжите заполнение."), wizard_keyboard(chat_id, user_id))
+                show_current_wizard_step(chat_id, user_id)
             else:
                 render(chat_id, user_id, {"view": "admin_home", "user": call.from_user})
             return
@@ -537,7 +611,7 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
             return
         if data == "wizard:cancel":
             clear_wizard(chat_id, user_id)
-            send_or_edit(chat_id, user_id, "Заполнение отменено.", keyboard([], back=True))
+            send_or_edit(chat_id, user_id, "Заполнение отменено.", keyboard([], back=True, admin_home=True))
             return
         if data == "wizard:skip":
             state = session.get("state")
@@ -577,12 +651,17 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
                 go_to_step(chat_id, user_id, "dish_photo", draft)
                 return
             if state == "dish_photo":
-                finish_dish_creation(chat_id, call.from_user, draft, None)
+                draft["photo_object_key"] = None
+                go_to_step(chat_id, user_id, "dish_preview", draft)
                 return
             if state and state.startswith("edit_dish_"):
                 field = state.replace("edit_dish_", "")
                 apply_dish_edit(chat_id, call.from_user, draft, field, None, skipped=True)
                 return
+        if data == "wizard:save_dish":
+            draft = session.get("draft", {})
+            finish_dish_creation(chat_id, call.from_user, draft)
+            return
         if data == "wizard:back":
             history = session.get("history", [])
             if history:
@@ -591,7 +670,7 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
                 session["draft"] = previous.get("draft", {})
                 save_wizard(chat_id, user_id)
             state = session.get("state")
-            send_or_edit(chat_id, user_id, STATE_PROMPTS.get(state, "Продолжите заполнение."), wizard_keyboard(chat_id, user_id))
+            show_current_wizard_step(chat_id, user_id)
             return
 
         if data == "nav:back":
@@ -599,6 +678,10 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
                 session["stack"].pop()
             if session["stack"]:
                 render(chat_id, user_id, session["stack"][-1])
+            return
+        if data == "adm:home":
+            clear_wizard(chat_id, user_id)
+            render(chat_id, user_id, {"view": "admin_home", "user": call.from_user})
             return
         if data == "adm:create_admin_invite":
             error, link = service.create_admin_invite(actor(call.from_user), get_bot_username())
@@ -657,9 +740,16 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
             field = parts[2]
             dish = service.get_dish(UUID(parts[3]))
             if not dish:
-                send_or_edit(chat_id, user_id, "Блюдо не найдено.", keyboard([], back=True))
+                send_or_edit(chat_id, user_id, "Блюдо не найдено.", keyboard([], back=True, admin_home=True))
                 return
-            start_wizard(chat_id, user_id, f"edit_dish_{field}", {"dish_id": dish.id})
+            current_values = {
+                "title": dish.title,
+                "description": dish.description,
+                "price": dish.price,
+                "weight": dish.weight,
+                "photo": "фото уже добавлено" if dish.photo_file_id else None,
+            }
+            start_wizard(chat_id, user_id, f"edit_dish_{field}", {"dish_id": dish.id, "current_value": current_values.get(field)})
             return
         if data.startswith("adm:toggledish:"):
             dish = service.get_dish(UUID(data.split(":")[2]))
@@ -705,6 +795,15 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
                 send_or_edit(chat_id, user_id, "Категория не найдена.", keyboard([], back=True))
                 return
             render(chat_id, user_id, {"view": "public_category", "branch_id": category.branch_id, "category_id": category.id}, push=True)
+            return
+        if data.startswith("pub:catp:"):
+            parts = data.split(":")
+            category = service.repository.get_category(UUID(parts[2]))
+            if not category:
+                send_or_edit(chat_id, user_id, "Категория не найдена.", keyboard([], back=True))
+                return
+            page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+            render(chat_id, user_id, {"view": "public_category", "branch_id": category.branch_id, "category_id": category.id, "page": page})
             return
         if data.startswith("pub:dish:"):
             render(chat_id, user_id, {"view": "public_dish", "dish_id": UUID(data.split(":")[2])}, push=True)
@@ -811,7 +910,10 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
             go_to_step(message.chat.id, message.from_user.id, "dish_price", draft)
             return
         if state == "dish_price":
-            draft["price"] = int(text) if text.isdigit() else None
+            if not text.isdigit():
+                send_or_edit(message.chat.id, message.from_user.id, "Цена должна быть целым числом. Например: 2500. Если цену пока не нужно показывать, нажмите «Пропустить».", wizard_keyboard(message.chat.id, message.from_user.id))
+                return
+            draft["price"] = int(text)
             go_to_step(message.chat.id, message.from_user.id, "dish_weight", draft)
             return
         if state == "dish_weight":
@@ -819,16 +921,18 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
             go_to_step(message.chat.id, message.from_user.id, "dish_photo", draft)
             return
         if state == "dish_photo":
-            photo_object_key = None
             if message.photo:
                 file_id = message.photo[-1].file_id
                 file_info = bot.get_file(file_id)
                 photo_bytes = bot.download_file(file_info.file_path)
-                photo_object_key = photo_storage.put_bytes(photo_bytes)
+                draft["photo_object_key"] = photo_storage.put_bytes(photo_bytes)
             elif text.lower() != "пропустить":
                 send_or_edit(message.chat.id, message.from_user.id, "Отправьте фото блюда или нажмите «Пропустить».", wizard_keyboard(message.chat.id, message.from_user.id))
                 return
-            finish_dish_creation(message.chat.id, message.from_user, draft, photo_object_key)
+            else:
+                draft["photo_object_key"] = None
+            go_to_step(message.chat.id, message.from_user.id, "dish_preview", draft)
+            return
 
     @bot.message_handler(func=lambda message: True, content_types=["text", "photo", "document", "audio", "video", "voice", "sticker", "location", "contact"])
     def handle_cleanup_unmatched(message: telebot.types.Message) -> None:
