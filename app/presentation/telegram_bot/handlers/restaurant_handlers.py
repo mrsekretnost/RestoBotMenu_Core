@@ -159,6 +159,8 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
         state = session.get("state")
         if state == "dish_preview":
             markup.row(types.InlineKeyboardButton(text="Сохранить блюдо", callback_data="wizard:save_dish"))
+        elif state_has_saved_value(state, session.get("draft", {})):
+            markup.row(types.InlineKeyboardButton(text="Далее", callback_data="wizard:next"))
         if state in SKIPPABLE_STATES:
             markup.row(types.InlineKeyboardButton(text="Пропустить", callback_data="wizard:skip"))
         row = []
@@ -184,6 +186,30 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
         if value is None or value == "":
             return "пока не указано"
         return str(value)
+
+    def state_has_saved_value(state: str | None, draft: dict) -> bool:
+        if not state:
+            return False
+        value_keys = {
+            "create_fr_title": "title",
+            "create_fr_slug": "slug",
+            "create_fr_description": "description",
+            "branch_title": "title",
+            "branch_address": "address",
+            "branch_phone": "phone",
+            "add_category": "title",
+            "dish_title": "title",
+            "dish_description": "description",
+            "dish_price": "price",
+            "dish_weight": "weight",
+            "dish_photo": "photo_object_key",
+        }
+        if state in value_keys:
+            key = value_keys[state]
+            return key in draft and draft.get(key) not in ("",)
+        if state.startswith("edit_dish_"):
+            return "current_value" in draft
+        return False
 
     def prompt_for_state(state: str | None, draft: dict) -> str:
         if not state:
@@ -247,6 +273,68 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
         session["draft"] = draft
         save_wizard(chat_id, user_id)
         send_or_edit(chat_id, user_id, prompt_for_state(state, draft), wizard_keyboard(chat_id, user_id))
+
+    def advance_with_saved_value(chat_id: int, user, state: str | None, draft: dict) -> None:
+        if not state or not state_has_saved_value(state, draft):
+            show_current_wizard_step(chat_id, user.id)
+            return
+        if state == "create_fr_title":
+            go_to_step(chat_id, user.id, "create_fr_slug", draft)
+            return
+        if state == "create_fr_slug":
+            go_to_step(chat_id, user.id, "create_fr_description", draft)
+            return
+        if state == "create_fr_description":
+            error, franchise = service.create_franchise(CreateFranchiseCommand(
+                telegram_id=user.id, username=user.username, first_name=user.first_name,
+                title=draft.get("title", ""), slug=draft.get("slug", ""), description=draft.get("description"),
+            ))
+            clear_wizard(chat_id, user.id)
+            render(chat_id, user.id, {"view": "franchise", "franchise_id": franchise.id}) if franchise and not error else send_or_edit(chat_id, user.id, error or "Не удалось создать франшизу.", keyboard([], back=True))
+            return
+        if state == "branch_title":
+            go_to_step(chat_id, user.id, "branch_address", draft)
+            return
+        if state == "branch_address":
+            go_to_step(chat_id, user.id, "branch_phone", draft)
+            return
+        if state == "branch_phone":
+            error, branch = service.create_branch(CreateBranchCommand(
+                telegram_id=user.id, username=user.username, first_name=user.first_name,
+                franchise_id=draft["franchise_id"], title=draft.get("title", ""), address=draft.get("address"), phone=draft.get("phone"),
+            ))
+            clear_wizard(chat_id, user.id)
+            render(chat_id, user.id, {"view": "branch", "branch_id": branch.id}) if branch and not error else send_or_edit(chat_id, user.id, error or "Не удалось создать филиал.", keyboard([], back=True))
+            return
+        if state == "add_category":
+            error, category = service.create_category(CreateCategoryCommand(
+                telegram_id=user.id, username=user.username, first_name=user.first_name,
+                branch_id=draft["branch_id"], title=draft.get("title", ""),
+            ))
+            branch_id = draft["branch_id"]
+            clear_wizard(chat_id, user.id)
+            render(chat_id, user.id, {"view": "categories", "branch_id": branch_id}) if not error else send_or_edit(chat_id, user.id, error, keyboard([], back=True))
+            return
+        if state == "dish_title":
+            go_to_step(chat_id, user.id, "dish_description", draft)
+            return
+        if state == "dish_description":
+            go_to_step(chat_id, user.id, "dish_price", draft)
+            return
+        if state == "dish_price":
+            go_to_step(chat_id, user.id, "dish_weight", draft)
+            return
+        if state == "dish_weight":
+            go_to_step(chat_id, user.id, "dish_photo", draft)
+            return
+        if state == "dish_photo":
+            go_to_step(chat_id, user.id, "dish_preview", draft)
+            return
+        if state.startswith("edit_dish_"):
+            field = state.replace("edit_dish_", "")
+            apply_dish_edit(chat_id, user, draft, field, None, skipped=True)
+            return
+        show_current_wizard_step(chat_id, user.id)
 
     def render(chat_id: int, user_id: int, screen: dict, push: bool = False) -> None:
         clear_wizard(chat_id, user_id)
@@ -612,6 +700,9 @@ def register_restaurant_handlers(bot: telebot.TeleBot, service: RestaurantServic
         if data == "wizard:cancel":
             clear_wizard(chat_id, user_id)
             send_or_edit(chat_id, user_id, "Заполнение отменено.", keyboard([], back=True, admin_home=True))
+            return
+        if data == "wizard:next":
+            advance_with_saved_value(chat_id, call.from_user, session.get("state"), session.get("draft", {}))
             return
         if data == "wizard:skip":
             state = session.get("state")
